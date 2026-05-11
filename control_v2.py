@@ -1,11 +1,37 @@
 import serial
 import time
 import sys
+import struct
 
 # --- CONFIGURATION ---
 PORT = 'COM4' 
 BAUD = 1000000
 CAMERA_INDEX = 1  # Change this to your USB webcam index (0, 1, 2, etc.)
+
+# robot constants for inverse kinematics
+WHEEL_RADIUS_A = 0.0297
+HALF_WHEELBASE_D = 0.0537
+HALF_TRACK_L =  0.0375
+RAD_PER_SEC_TO_RPM = 60.0 / (2.0 * 3.14159)
+
+MAX_VELOCITY = 0.4  # Max linear velocity in m/s
+
+# Binary protocol constants
+CMD_SET_VELOCITY = 0x01
+CMD_STOP = 0x02
+
+def clamp(value, min_value, max_value):
+    return max(min(value, max_value), min_value)
+
+def create_velocity_command(fl_rpm, fr_rpm, rl_rpm, rr_rpm):
+    """Create binary command: [0x01][4 floats]"""
+    cmd = struct.pack('<Bffff', CMD_SET_VELOCITY, fl_rpm, fr_rpm, rl_rpm, rr_rpm)
+    return cmd
+
+def create_stop_command():
+    """Create binary command: [0x02]"""
+    cmd = struct.pack('<B', CMD_STOP)
+    return cmd
 
 print(f"Opening serial port {PORT} at {BAUD} baud...")
 try:
@@ -54,10 +80,27 @@ class PID:
 # pid_x = PID(kp=0.5, ki=0.01, kd=0.1)
 # velocity_x = pid_x.calculate(error_x)
 
-pid_x = PID(kp=0.2, ki=0.0, kd=0.2)
-pid_y = PID(kp=0.2, ki=0.0, kd=0.2)
+pid_x = PID(kp=0.6, ki=0.0, kd=0.4)
+pid_y = PID(kp=0.4, ki=0.0, kd=0.4)
 start_time = time.time()  # Initialize before loop
 
+def ik(forwardBackVel, leftRightVel, rotVel):
+    # Desired robot velocities in body frame.
+    u = forwardBackVel
+    v = leftRightVel
+    r = rotVel
+    # Wheel angular velocities (rad/s).
+    w1 = (1.0 / WHEEL_RADIUS_A) * (u + v + (-HALF_WHEELBASE_D + HALF_TRACK_L) * r)  # front left
+    w2 = (1.0 / WHEEL_RADIUS_A) * (u - v + (-HALF_WHEELBASE_D + HALF_TRACK_L) * r)  # front right
+    w3 = (1.0 / WHEEL_RADIUS_A) * (u + v + ( HALF_WHEELBASE_D - HALF_TRACK_L) * r)  # rear left
+    w4 = (1.0 / WHEEL_RADIUS_A) * (u - v + ( HALF_WHEELBASE_D - HALF_TRACK_L) * r)  # rear right
+    # Convert rad/s -> RPM.
+    frontLeftRpm  = w1 * RAD_PER_SEC_TO_RPM
+    frontRightRpm = w2 * RAD_PER_SEC_TO_RPM
+    rearLeftRpm   = w3 * RAD_PER_SEC_TO_RPM
+    rearRightRpm  = w4 * RAD_PER_SEC_TO_RPM
+
+    return frontLeftRpm, frontRightRpm, rearLeftRpm, rearRightRpm
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -70,7 +113,7 @@ while cap.isOpened():
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(img_rgb)
 
-    if results.multi_hand_landmarks != None:
+    if results.multi_hand_landmarks:
         for hand_lms in results.multi_hand_landmarks:
             # Draw the connections on the hand
             mp_draw.draw_landmarks(frame, hand_lms, mp_hands.HAND_CONNECTIONS)
@@ -105,24 +148,25 @@ while cap.isOpened():
             if error_x == 0 and error_y == 0:
                 pid_x.reset()
                 pid_y.reset()
-                cmd =f"CMD,0.000,0.000,0.000\n"
-                ser.write(cmd.encode('ascii'))
+                cmd = create_velocity_command(0.0, 0.0, 0.0, 0.0)
+                ser.write(cmd)
                 continue
             
             # Use persistent controller state across frames.
-            velocity_x = -pid_x.calculate(error_x)
-            velocity_y = -pid_y.calculate(error_y)
+            velocity_x = -pid_x.calculate(error_x) #left/right vel
+            velocity_y = -pid_y.calculate(error_y) #forward/back vel
 
-            if abs(velocity_x) > 0.2:
-                velocity_x = 0.2 * (velocity_x / abs(velocity_x))  # Limit to max speed while keeping sign
-            if abs(velocity_y) > 0.2:
-                velocity_y = 0.2 * (velocity_y / abs(velocity_y))  # Limit to max speed while keeping sign
+            velocity_x = clamp(velocity_x, -MAX_VELOCITY, MAX_VELOCITY)
+            velocity_y = clamp(velocity_y, -MAX_VELOCITY, MAX_VELOCITY)
+
 
             # Print them to see the "Control Signal" in the terminal
             print(f"Error X: {error_x}, Error Y: {error_y}, Vx: {velocity_x}, Vy: {velocity_y}")
 
-            cmd =f"CMD,{velocity_y:.3f},{velocity_x:.3f},0.000\n"
-            ser.write(cmd.encode('ascii'))
+            frontLeftRpm, frontRightRpm, rearLeftRpm, rearRightRpm = ik(velocity_y, velocity_x, 0)  # No rotation control for now
+            print(f"Wheel RPMs: FL={frontLeftRpm:.1f}, FR={frontRightRpm:.1f}, RL={rearLeftRpm:.1f}, RR={rearRightRpm:.1f}")    
+            cmd = create_velocity_command(frontLeftRpm, frontRightRpm, rearLeftRpm, rearRightRpm)
+            ser.write(cmd)
             
             # Highlight the tracking point
             cv2.circle(frame, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
@@ -130,8 +174,8 @@ while cap.isOpened():
     else:
         pid_x.reset()
         pid_y.reset()
-        cmd =f"CMD,0.000,0.000,0.000\n"
-        ser.write(cmd.encode('ascii'))
+        cmd = create_velocity_command(0.0, 0.0, 0.0, 0.0)
+        ser.write(cmd)
 
     # Draw deadzone box in red (20% from center)
     h, w, c = frame.shape
@@ -149,6 +193,7 @@ while cap.isOpened():
         break
 
 print("Exiting... Sending stop command to robot.")
+ser.write(create_stop_command())
 pid_x.reset()
 pid_y.reset()
 
